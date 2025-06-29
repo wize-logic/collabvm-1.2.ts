@@ -106,12 +106,7 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	private pcmQueueBuffers: Buffer[] = [];
 	private pcmQueueLength = 0;
 	private processingAudio = false;
-	
-	// Resampling filter history
-	private readonly kernelRadius = 8;
-	private historyLeft = new Float64Array(this.kernelRadius);
-	private historyRight = new Float64Array(this.kernelRadius);
-	private partial44Buffer: Buffer | null = null;
+	private partialBuffer: Buffer | null = null;
 
 	private logger = pino({ name: 'CVMTS.Server' });
 
@@ -198,11 +193,15 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 			try {
 				user.protocol.processMessage(buf);
 			} catch (err) {
-				this.logger.error({
-					ip: user.IP.address,
-					username: user.username,
-					error_message: (err as Error).message
-				}, 'Error in %s#processMessage.', Object.getPrototypeOf(user.protocol).constructor?.name);
+				this.logger.error(
+					{
+						ip: user.IP.address,
+						username: user.username,
+						error_message: (err as Error).message
+					},
+					'Error in %s#processMessage.',
+					Object.getPrototypeOf(user.protocol).constructor?.name
+				);
 				user.kick();
 			}
 		});
@@ -707,8 +706,7 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 			this.screenHidden = false;
 			let displaySize = this.VM.GetDisplay()?.Size();
 
-			if(displaySize == undefined)
-				return;
+			if (displaySize == undefined) return;
 
 			let encoded = await this.MakeRectData({
 				x: 0,
@@ -1035,102 +1033,28 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		});
 		return { yes: yes, no: no };
 	}
-	
-	// Convert 44.1 kHz PCM to 48 kHz PCM
-	private resampleChunk(pcm44: Buffer): Buffer {
-		const inBytes = pcm44.length;
-		if (inBytes % 4 !== 0) return Buffer.alloc(0);
-	
-		const neededInFrames = 441; // 10 ms @ 44.1 kHz
-		const neededBytes = neededInFrames * 4;
-		if (inBytes < neededBytes) return Buffer.alloc(0);
-	
-		const { kernelRadius } = this;
-		const filterWidth = kernelRadius * 2;
-	
-		const block44 = pcm44.slice(0, neededBytes);
-	
-		const paddedLen = neededInFrames + kernelRadius * 2;
-		const paddedLeft = new Float64Array(paddedLen);
-		const paddedRight = new Float64Array(paddedLen);
-	
-		for (let i = 0; i < kernelRadius; i++) {
-			paddedLeft[i] = this.historyLeft[i];
-			paddedRight[i] = this.historyRight[i];
-		}
-		for (let i = 0; i < neededInFrames; i++) {
-			const b = i * 4;
-			paddedLeft[i + kernelRadius] = block44.readInt16LE(b);
-			paddedRight[i + kernelRadius] = block44.readInt16LE(b + 2);
-		}
-		// Last kernelRadius samples remain zero.
-	
-		const window: number[] = new Array(filterWidth + 1);
-		for (let n = 0; n <= filterWidth; n++) {
-			window[n] = 0.54 - 0.46 * Math.cos((2 * Math.PI * n) / filterWidth);
-		}
-		const sinc = (x: number) => (x === 0 ? 1 : Math.sin(Math.PI * x) / (Math.PI * x));
-	
-		const ratio = 48000 / 44100;
-		const outFrames = 480; // 10 ms @ 48 kHz
-		const outBuf = Buffer.alloc(outFrames * 4);
-	
-		for (let iOut = 0; iOut < outFrames; iOut++) {
-			const center = iOut / ratio + kernelRadius;
-			const baseIndex = Math.floor(center);
-	
-			for (let ch = 0; ch < 2; ch++) {
-				const arr = ch === 0 ? paddedLeft : paddedRight;
-				let acc = 0,
-					wSum = 0;
-	
-				for (let tap = 0; tap <= filterWidth; tap++) {
-					const tapIndex = baseIndex - kernelRadius + tap;
-					const dist = tapIndex - center;
-					const coeff = sinc(dist) * window[tap];
-					wSum += coeff;
-					acc += arr[tapIndex] * coeff;
-				}
-	
-				const val = wSum !== 0 ? acc / wSum : 0;
-				const clipped = Math.max(-32768, Math.min(32767, Math.round(val)));
-				outBuf.writeInt16LE(clipped, iOut * 4 + ch * 2);
-			}
-		}
-	
-		const firstIdxOfLast8 = kernelRadius + neededInFrames - kernelRadius;
-		for (let i = 0; i < kernelRadius; i++) {
-			this.historyLeft[i] = paddedLeft[firstIdxOfLast8 + i];
-			this.historyRight[i] = paddedRight[firstIdxOfLast8 + i];
-		}
-	
-		return outBuf;
-	}
-	
-	// Accumulate 44.1 kHz data in 441-frame blocks, convert to 480-frame @ 48 kHz, then queue for Opus:
-	private enqueuePCM(pcm44: Buffer) {
-		this.partial44Buffer = Buffer.concat([this.partial44Buffer || Buffer.alloc(0), pcm44]);
-		const needed44Bytes = 441 * 4;
-	
-		while ((this.partial44Buffer?.length || 0) >= needed44Bytes) {
-			const block44 = this.partial44Buffer.slice(0, needed44Bytes);
-			this.partial44Buffer = this.partial44Buffer.slice(needed44Bytes);
-	
-			const pcm48 = this.resampleChunk(block44);
-			if (pcm48.length === 0) continue;
-	
+
+	private enqueuePCM(pcm48: Buffer) {
+		// accumulate until we have at least one full 48 kHz frame
+		// @ts-ignore
+		this.partialBuffer = Buffer.concat([this.partialBuffer || Buffer.alloc(0), pcm48]);
+
+		while (this.partialBuffer.length >= this.FRAME_BYTES) {
+			const frame = this.partialBuffer.slice(0, this.FRAME_BYTES);
+			this.partialBuffer = this.partialBuffer.slice(this.FRAME_BYTES);
+
 			if (this.pcmQueueLength + this.FRAME_BYTES <= this.MAX_PCM_QUEUE_BYTES) {
-				this.pcmQueueBuffers.push(pcm48);
+				this.pcmQueueBuffers.push(frame);
 				this.pcmQueueLength += this.FRAME_BYTES;
 			}
 		}
-	
+
 		if (!this.processingAudio && this.pcmQueueLength >= this.FRAME_BYTES) {
 			this.processingAudio = true;
 			this.processAudioQueue();
 		}
 	}
-	
+
 	// Encode queued PCM to Opus and send to clients
 	private processAudioQueue() {
 		while (this.pcmQueueLength >= this.FRAME_BYTES) {
@@ -1145,5 +1069,4 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		}
 		this.processingAudio = false;
 	}
-	
 }

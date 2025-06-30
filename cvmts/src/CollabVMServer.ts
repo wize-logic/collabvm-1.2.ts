@@ -125,6 +125,12 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
 		this.opusEncoder = new OpusEncoder(48000, 2); // initiate opus encoder
 
+		//this.opusEncoder.applyEncoderCTL(4000, 2048);      // OPUS_APPLICATION_VOIP (use AUDIO for music)
+		//this.opusEncoder.applyEncoderCTL(4002, 64000);     // 64 kbps (or 48k for ultra low)
+		//this.opusEncoder.applyEncoderCTL(4010, 6);         // Complexity 6
+		//this.opusEncoder.applyEncoderCTL(4012, 0);         // FEC off (TCP)
+		//this.opusEncoder.applyEncoderCTL(4016, 1);         // DTX on (for silence skipping)
+
 		this.indefiniteTurn = null;
 		this.ModPerms = Utilities.MakeModPerms(this.Config.collabvm.moderatorPermissions);
 

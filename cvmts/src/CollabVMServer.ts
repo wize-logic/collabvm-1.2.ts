@@ -13,6 +13,7 @@ import AuthManager from './AuthManager.js';
 import { JPEGEncoder } from './JPEGEncoder.js';
 import VM from './vm/interface.js';
 import { ReaderModel } from '@maxmind/geoip2-node';
+import { writeFile } from "fs/promises";
 
 import { Size, Rect } from './Utilities.js';
 import pino from 'pino';
@@ -108,6 +109,9 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	private processingAudio = false;
 	private partialBuffer: Buffer | null = null;
 
+	// base64 for file uploads
+	private base64data = '';
+
 	private logger = pino({ name: 'CVMTS.Server' });
 
 	constructor(config: IConfig, vm: VM, banmgr: BanManager, auth: AuthManager | null, geoipReader: ReaderModel | null) {
@@ -125,8 +129,8 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
 		this.opusEncoder = new OpusEncoder(48000, 2); // initiate opus encoder
 
-		this.opusEncoder.applyEncoderCTL(4012, 0);         // FEC off (TCP)
-		this.opusEncoder.applyEncoderCTL(4016, 1);         // DTX on (for silence skipping)
+		this.opusEncoder.applyEncoderCTL(4012, 0); // FEC off (TCP)
+		this.opusEncoder.applyEncoderCTL(4016, 1); // DTX on (for silence skipping)
 
 		this.indefiniteTurn = null;
 		this.ModPerms = Utilities.MakeModPerms(this.Config.collabvm.moderatorPermissions);
@@ -356,6 +360,28 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		user.protocol.sendCapabilities(enabledCaps);
 		return true;
 	}
+
+	onUpload(user: User, chunk: string, fileName: string, done: boolean) {
+		this.base64data += chunk;
+		if (done) {
+			console.log("Got finished file.");
+			try {
+				const filePath = `/tmp/${fileName}`;
+				const buf = Buffer.from(this.base64data, 'base64');
+				this.injectFile(filePath, buf);
+				this.base64data = '';
+				console.log(`[File upload] ${user.IP.address} (${user.username}) uploaded ${fileName} at ${new Date().toISOString()}`);
+				
+				for (const u of this.clients) {
+					if (u.socket.isOpen()) {
+						u.protocol.sendChatMessage('', `${user.username} uploaded ${fileName}`);
+					}
+				}
+			} catch (err) {
+				console.error('Upload error:', err);
+			}
+		}
+	}	
 
 	onTurnRequest(user: User, forfeit: boolean): void {
 		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
@@ -1071,5 +1097,16 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 			}
 		}
 		this.processingAudio = false;
+	}
+
+	private async injectFile(localPath: string, fileBuffer: Buffer) {
+		try {
+			console.log(`[injectFile] Writing ${fileBuffer.length} bytes to ${localPath}`);
+			//@ts-ignore
+			await writeFile(localPath, fileBuffer);
+			console.log('[injectFile] File written successfully.');
+		} catch (err) {
+			console.error('[injectFile] Error during file write:', err);
+		}
 	}
 }

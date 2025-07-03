@@ -59,7 +59,11 @@ export interface IProtocolMessageHandler {
 	onConnect(user: User, node: string): void;
 	onView(user: User, node: string, viewMode: number): void;
 
-	onAudioMute(user: User): void; // user requests an audio mute/unmute
+	// User requests an audio mute/unmute
+	onAudioMute(user: User): void;
+
+	// File upload
+	onUpload(user: User, base64data: string, fileName: string, done: boolean): void;
 
 	// Admin handlers
 	onAdminLogin(user: User, password: string): void;

@@ -192,6 +192,15 @@ export class GuacamoleProtocol extends ProtocolBase implements IProtocol {
 				this.handlers?.onAudioMute(this.user!);
 			break;
 
+			case 'upload':
+				if (decodedElements.length !== 4) return false;
+				let chunk: string = decodedElements[1];
+				let fileName: string = decodedElements[2];
+				const done: boolean = decodedElements[3] === "true";
+				this.handlers?.onUpload(this.user!, chunk, fileName, done);
+
+			break;
+
 			case 'admin':
 				if (decodedElements.length < 2) return false;
 				return this.__processMessage_admin(decodedElements);

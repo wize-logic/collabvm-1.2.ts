@@ -14,6 +14,7 @@ import { JPEGEncoder } from './JPEGEncoder.js';
 import VM from './vm/interface.js';
 import { ReaderModel } from '@maxmind/geoip2-node';
 import { writeFile } from "fs/promises";
+import { appendFile, unlink } from "fs/promises";
 
 import { Size, Rect } from './Utilities.js';
 import pino from 'pino';
@@ -109,8 +110,10 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	private processingAudio = false;
 	private partialBuffer: Buffer | null = null;
 
-	// base64 for file uploads
-	private base64data = '';
+	// file uploads
+	private ongoingUploads: { [username: string]: { [filename: string]: boolean } } = {};
+	private blockedUploads: { [username: string]: Set<string> } = {};
+	private MAX_ONGOING_UPLOADS: number; // adjust as needed
 
 	private logger = pino({ name: 'CVMTS.Server' });
 
@@ -124,6 +127,7 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		this.voteTime = 0;
 		this.voteCooldown = 0;
 		this.turnsAllowed = true;
+		this.MAX_ONGOING_UPLOADS = 1;
 		this.screenHidden = false;
 		this.screenHiddenImg = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhidden.jpeg'));
 		this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
@@ -230,6 +234,10 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	}
 
 	private connectionClosed(user: User) {
+		const username = user.username ?? user.IP.address; // Fallback if anonymous
+		if (this.ongoingUploads[username]) {
+			delete this.ongoingUploads[username]; // Delete any ongoing uploads
+		}
 		let clientIndex = this.clients.indexOf(user);
 		if (clientIndex === -1) return;
 
@@ -361,28 +369,61 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		return true;
 	}
 
-	onUpload(user: User, chunk: string, fileName: string, done: boolean) {
-		this.base64data += chunk;
-		if (done) {
-			console.log("Got finished file.");
-			try {
-				const filePath = `/tmp/${fileName}`;
-				const buf = Buffer.from(this.base64data, 'base64');
-				this.injectFile(filePath, buf);
-				this.base64data = '';
-				console.log(`[File upload] ${user.IP.address} (${user.username}) uploaded ${fileName} at ${new Date().toISOString()}`);
-				
+	async onUpload(user: User, chunk: string, fileName: string, done: boolean) {
+		const username = user.username ?? user.IP.address;
+		const filePath = `/tmp/${fileName}`;
+		const buf = Buffer.from(chunk, 'base64');
+	
+		if (!this.ongoingUploads[username]) this.ongoingUploads[username] = {};
+		if (!this.blockedUploads[username]) this.blockedUploads[username] = new Set();
+	
+		// If file is blocked, ignore all chunks for it
+		if (this.blockedUploads[username].has(fileName)) return;
+	
+		// Only check for new file uploads (not already ongoing)
+		if (!Object.prototype.hasOwnProperty.call(this.ongoingUploads[username], fileName)) {
+			const uploadsInProgress = Object.keys(this.ongoingUploads[username]).length;
+			if (uploadsInProgress >= this.MAX_ONGOING_UPLOADS) {
+				// Mark this file as blocked for this user
+				this.blockedUploads[username].add(fileName);
+				// Send error (only once per file per full period)
+				user.protocol.sendChatMessage('', `You are already uploading ${this.MAX_ONGOING_UPLOADS} files. Finish or cancel one before starting another.`);
+				return;
+			}
+			// Start tracking this new file upload
+			this.ongoingUploads[username][fileName] = true;
+			// Just in case: remove from blocked set if previously blocked
+			this.blockedUploads[username].delete(fileName);
+			try { await unlink(filePath); } catch (e) { /* Ignore if file doesn't exist */ }
+		}
+	
+		try {
+			// @ts-ignore
+			await appendFile(filePath, buf);
+	
+			if (done) {
+				delete this.ongoingUploads[username][fileName];
+				if (Object.keys(this.ongoingUploads[username]).length === 0) {
+					delete this.ongoingUploads[username];
+					this.blockedUploads[username].clear();
+				}
+				this.logger.info(`${user.IP.address} (${username}) uploaded ${fileName} at ${new Date().toISOString()}`);
 				for (const u of this.clients) {
 					if (u.socket.isOpen()) {
-						u.protocol.sendChatMessage('', `${user.username} uploaded ${fileName}`);
+						u.protocol.sendChatMessage('', `${username} uploaded ${fileName}`);
 					}
 				}
-			} catch (err) {
-				console.error('Upload error:', err);
+			}
+		} catch (err) {
+			console.error('Upload error:', err);
+			delete this.ongoingUploads[username][fileName];
+			if (Object.keys(this.ongoingUploads[username]).length === 0) {
+				delete this.ongoingUploads[username];
+				this.blockedUploads[username].clear();
 			}
 		}
-	}	
-
+	}
+	
 	onTurnRequest(user: User, forfeit: boolean): void {
 		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
 

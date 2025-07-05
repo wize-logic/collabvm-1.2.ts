@@ -111,9 +111,8 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	private partialBuffer: Buffer | null = null;
 
 	// file uploads
-	private ongoingUploads: { [username: string]: { [filename: string]: boolean } } = {};
-	private blockedUploads: { [username: string]: Set<string> } = {};
-	private MAX_ONGOING_UPLOADS: number; // adjust as needed
+	private ongoingUploads: Record<string, boolean> = {};
+	private uploadBuffers: Record<string, string[]> = {};
 
 	private logger = pino({ name: 'CVMTS.Server' });
 
@@ -127,7 +126,6 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		this.voteTime = 0;
 		this.voteCooldown = 0;
 		this.turnsAllowed = true;
-		this.MAX_ONGOING_UPLOADS = 1;
 		this.screenHidden = false;
 		this.screenHiddenImg = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhidden.jpeg'));
 		this.screenHiddenThumb = readFileSync(path.join(kCVMTSAssetsRoot, 'screenhiddenthumb.jpeg'));
@@ -234,10 +232,10 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 	}
 
 	private connectionClosed(user: User) {
-		const username = user.username ?? user.IP.address; // Fallback if anonymous
-		if (this.ongoingUploads[username]) {
-			delete this.ongoingUploads[username]; // Delete any ongoing uploads
-		}
+		const username = user.username ?? user.IP.address;
+		if (username in this.ongoingUploads) delete this.ongoingUploads[username];
+		if (username in this.uploadBuffers) delete this.uploadBuffers[username];
+
 		let clientIndex = this.clients.indexOf(user);
 		if (clientIndex === -1) return;
 
@@ -369,59 +367,48 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		return true;
 	}
 
+
 	async onUpload(user: User, chunk: string, fileName: string, done: boolean) {
-		const username = user.username ?? user.IP.address;
-		const filePath = `/tmp/${fileName}`;
-		const buf = Buffer.from(chunk, 'base64');
+		const username = user?.username ?? user?.IP?.address;
+		if (!username) return;
 	
-		// ensure we have a bucket for this user
-		if (!this.ongoingUploads[username]) {
-			this.ongoingUploads[username] = {};
-		}
-	
-		const isNewFile = !Object.prototype.hasOwnProperty.call(this.ongoingUploads[username], fileName);
-		const uploadsInProgress = Object.keys(this.ongoingUploads[username]).length;
-	
-		// if they're starting a new upload but already at the limit, disconnect them
-		if (isNewFile && uploadsInProgress >= this.MAX_ONGOING_UPLOADS) {
-			// tear down their socket
-			user.socket.close();
+		// Only block if they're trying to start a *new* upload while one is active
+		if (this.ongoingUploads[username] && !this.uploadBuffers[username]) {
+			// Already uploading and starting a new upload (not a chunk of the same upload)
+			user.socket?.close?.();
 			return;
 		}
 	
-		// mark this file as in-progress
-		if (isNewFile) {
-			this.ongoingUploads[username][fileName] = true;
-			try { await unlink(filePath); } catch { /* ignore */ }
+		// If not yet uploading, mark as uploading
+		if (!this.ongoingUploads[username]) {
+			this.ongoingUploads[username] = true;
+			this.uploadBuffers[username] = [];
 		}
 	
-		try {
-			// append the incoming chunk
-			// @ts-ignore
-			await appendFile(filePath, buf);
+		// Buffer the base64 string
+		this.uploadBuffers[username].push(chunk ?? '');
 	
-			if (done) {
-				// clean up when finished
-				delete this.ongoingUploads[username][fileName];
-				if (Object.keys(this.ongoingUploads[username]).length === 0) {
-					delete this.ongoingUploads[username];
-				}
-				this.logger.info(`${user.IP.address} (${username}) uploaded ${fileName} at ${new Date().toISOString()}`);
-				for (const u of this.clients) {
-					if (u.socket.isOpen()) {
-						u.protocol.sendChatMessage('', `${username} uploaded ${fileName}`);
-					}
-				}
-			}
-		} catch (err) {
-			console.error('Upload error:', err);
-			// on error, also clean up
-			delete this.ongoingUploads[username][fileName];
-			if (Object.keys(this.ongoingUploads[username]).length === 0) {
-				delete this.ongoingUploads[username];
-			}
+		if (done) {
+			const filePath = `/srv/samba/uploads/${fileName}`;
+			const base64String = this.uploadBuffers[username].join('');
+			const fileBuffer = Buffer.from(base64String, 'base64');
+	
+			await this.injectFile(filePath, fileBuffer);
+	
+			// Logging
+			const ip = user?.IP?.address ?? 'unknown';
+			this.logger?.info?.(`${ip} (${username}) uploaded ${fileName} at ${new Date().toISOString()}`);
+	
+			// Chat notification
+			this.clients?.forEach?.(u => {
+				u?.socket?.isOpen?.() && u.protocol?.sendChatMessage?.('', `${username} uploaded ${fileName}`);
+			});
+	
+			// Cleanup ASAP after write
+			delete this.ongoingUploads[username];
+			delete this.uploadBuffers[username];
 		}
-	}	
+	}
 	
 	onTurnRequest(user: User, forfeit: boolean): void {
 		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
@@ -1141,10 +1128,10 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 
 	private async injectFile(localPath: string, fileBuffer: Buffer) {
 		try {
-			console.log(`[injectFile] Writing ${fileBuffer.length} bytes to ${localPath}`);
-			//@ts-ignore
+			// console.log(`[injectFile] Writing ${fileBuffer.length} bytes to ${localPath}`);
+			// @ts-ignore
 			await writeFile(localPath, fileBuffer);
-			console.log('[injectFile] File written successfully.');
+			// console.log('[injectFile] File written successfully.');
 		} catch (err) {
 			console.error('[injectFile] Error during file write:', err);
 		}

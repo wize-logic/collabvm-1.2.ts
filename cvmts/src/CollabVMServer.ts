@@ -374,38 +374,37 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 		const filePath = `/tmp/${fileName}`;
 		const buf = Buffer.from(chunk, 'base64');
 	
-		if (!this.ongoingUploads[username]) this.ongoingUploads[username] = {};
-		if (!this.blockedUploads[username]) this.blockedUploads[username] = new Set();
+		// ensure we have a bucket for this user
+		if (!this.ongoingUploads[username]) {
+			this.ongoingUploads[username] = {};
+		}
 	
-		// If file is blocked, ignore all chunks for it
-		if (this.blockedUploads[username].has(fileName)) return;
+		const isNewFile = !Object.prototype.hasOwnProperty.call(this.ongoingUploads[username], fileName);
+		const uploadsInProgress = Object.keys(this.ongoingUploads[username]).length;
 	
-		// Only check for new file uploads (not already ongoing)
-		if (!Object.prototype.hasOwnProperty.call(this.ongoingUploads[username], fileName)) {
-			const uploadsInProgress = Object.keys(this.ongoingUploads[username]).length;
-			if (uploadsInProgress >= this.MAX_ONGOING_UPLOADS) {
-				// Mark this file as blocked for this user
-				this.blockedUploads[username].add(fileName);
-				// Send error (only once per file per full period)
-				user.protocol.sendChatMessage('', `You are already uploading ${this.MAX_ONGOING_UPLOADS} files. Finish or cancel one before starting another.`);
-				return;
-			}
-			// Start tracking this new file upload
+		// if they're starting a new upload but already at the limit, disconnect them
+		if (isNewFile && uploadsInProgress >= this.MAX_ONGOING_UPLOADS) {
+			// tear down their socket
+			user.socket.close();
+			return;
+		}
+	
+		// mark this file as in-progress
+		if (isNewFile) {
 			this.ongoingUploads[username][fileName] = true;
-			// Just in case: remove from blocked set if previously blocked
-			this.blockedUploads[username].delete(fileName);
-			try { await unlink(filePath); } catch (e) { /* Ignore if file doesn't exist */ }
+			try { await unlink(filePath); } catch { /* ignore */ }
 		}
 	
 		try {
+			// append the incoming chunk
 			// @ts-ignore
 			await appendFile(filePath, buf);
 	
 			if (done) {
+				// clean up when finished
 				delete this.ongoingUploads[username][fileName];
 				if (Object.keys(this.ongoingUploads[username]).length === 0) {
 					delete this.ongoingUploads[username];
-					this.blockedUploads[username].clear();
 				}
 				this.logger.info(`${user.IP.address} (${username}) uploaded ${fileName} at ${new Date().toISOString()}`);
 				for (const u of this.clients) {
@@ -416,13 +415,13 @@ export default class CollabVMServer implements IProtocolMessageHandler {
 			}
 		} catch (err) {
 			console.error('Upload error:', err);
+			// on error, also clean up
 			delete this.ongoingUploads[username][fileName];
 			if (Object.keys(this.ongoingUploads[username]).length === 0) {
 				delete this.ongoingUploads[username];
-				this.blockedUploads[username].clear();
 			}
 		}
-	}
+	}	
 	
 	onTurnRequest(user: User, forfeit: boolean): void {
 		if ((!this.turnsAllowed || this.Config.collabvm.turnwhitelist) && user.rank !== Rank.Admin && user.rank !== Rank.Moderator && !user.turnWhitelist) return;
